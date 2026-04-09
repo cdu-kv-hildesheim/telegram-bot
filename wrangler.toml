@@ -1,0 +1,14 @@
+main = "src/index.ts"
+compatibility_date = "2026-01-17"
+
+# Bind a KV namespace for authorized users, pending join requests,
+# thread/issue mappings and media-group buffering.
+# Create it once per project:
+#   wrangler kv namespace create USERS
+# then paste the returned id here — or configure the binding in the
+# Cloudflare dashboard when deploying via Git integration.
+[[kv_namespaces]]
+binding = "USERS"
+
+[observability]
+enabled = false

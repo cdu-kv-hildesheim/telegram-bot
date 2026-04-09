@@ -1,0 +1,12 @@
+{
+  "webhook_url": "https://telegram.example.com/webhook/example",
+  "allowed_updates": ["message", "callback_query"],
+  "description": "I manage content for example.com. Use /new_task THEMA to start a new task — I'll open a thread where you describe the work via text, voice, photos or documents. Claude drafts the changes, you review a preview, and approve to publish.",
+  "short_description": "Content management for example.com",
+  "commands": [
+    { "command": "start", "description": "Start the bot and show help" },
+    { "command": "new_task", "description": "Start a new task — takes a topic: /new_task THEMA" },
+    { "command": "join", "description": "Request access" },
+    { "command": "users", "description": "List authorized users (admin only)" }
+  ]
+}

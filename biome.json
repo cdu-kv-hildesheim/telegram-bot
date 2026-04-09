@@ -1,0 +1,22 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.4.10/schema.json",
+  "assist": { "actions": { "source": { "organizeImports": "on" } } },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "recommended": true,
+      "correctness": {
+        "noUnusedVariables": "off",
+        "noUnusedImports": "warn"
+      }
+    }
+  },
+  "formatter": {
+    "enabled": true,
+    "indentStyle": "space",
+    "indentWidth": 2
+  },
+  "files": {
+    "includes": ["**/*.ts", "!**/node_modules", "!**/dist"]
+  }
+}

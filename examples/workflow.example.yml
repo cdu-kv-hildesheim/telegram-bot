@@ -1,0 +1,352 @@
+name: Telegram Claude
+
+on:
+  repository_dispatch:
+    types:
+      - telegram-plan
+      - telegram-execute
+
+concurrency:
+  group: telegram-${{ github.event.client_payload.site_id }}-${{ github.event.client_payload.issue_number }}
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    if: github.event.action == 'telegram-plan'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install markitdown
+        run: pip install markitdown
+
+      - name: Convert attached documents
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.client_payload.issue_number }}
+        run: |
+          ISSUE_BODY=$(gh issue view "$ISSUE_NUMBER" --json body -q '.body')
+          echo "" > /tmp/documents.md
+          echo "$ISSUE_BODY" | grep -oP '<!-- convertible:[^>]+-->' | while read -r marker; do
+            URL=$(echo "$marker" | sed -E 's/<!-- convertible:(.+):([^:]+) -->/\1/')
+            NAME=$(echo "$marker" | sed -E 's/<!-- convertible:(.+):([^:]+) -->/\2/')
+            EXT="${NAME##*.}"
+            TMP_FILE="/tmp/doc.${EXT}"
+            if curl -sL "$URL" -o "$TMP_FILE"; then
+              echo "### ${NAME}" >> /tmp/documents.md
+              markitdown "$TMP_FILE" >> /tmp/documents.md 2>/dev/null || echo "_(Konvertierung fehlgeschlagen)_" >> /tmp/documents.md
+              echo "" >> /tmp/documents.md
+            fi
+          done
+
+      - name: Prepare prompt
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.client_payload.issue_number }}
+        run: |
+          ISSUE_BODY=$(gh issue view "$ISSUE_NUMBER" --json body -q '.body')
+          COMMENTS=$(gh api "repos/${{ github.repository }}/issues/${ISSUE_NUMBER}/comments" -q '.[].body' 2>/dev/null || echo "")
+          DOCUMENTS=$(cat /tmp/documents.md 2>/dev/null || echo "")
+
+          cat > /tmp/prompt.txt <<PROMPT_EOF
+          ${ISSUE_BODY}
+
+          ---
+          Bisherige Kommentare:
+          ${COMMENTS}
+
+          ---
+          Konvertierte Dokumente (DOCX/PDF):
+          ${DOCUMENTS}
+          PROMPT_EOF
+
+      - name: Run Claude (Plan)
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            Lies den Auftrag aus /tmp/prompt.txt und analysiere ihn.
+            Site: ${{ github.event.client_payload.site_domain }}
+            Content-Verzeichnis: ${{ github.event.client_payload.site_content_dir }}
+            Issue-Nummer: ${{ github.event.client_payload.issue_number }}
+
+            Erstelle einen kurzen Plan (3-5 Stichpunkte), was geändert werden soll.
+            Lies CLAUDE.md und ${{ github.event.client_payload.site_content_dir }}/ für Content-Schemas.
+            NIEMALS Daten erfinden. Fehlende Infos als ❓ kennzeichnen.
+            Berücksichtige bisherige Kommentare und konvertierte Dokumente.
+            Nutze WebSearch um fehlende Infos wie Adressen nachzuschlagen.
+            Bei Bildern: unterscheide FOTO (Eventfoto, als Bild speichern) und
+            FLYER/EINLADUNG (Text-Dokument, Inhalt extrahieren).
+
+            Poste den fertigen Plan als Kommentar an das Issue:
+            gh issue comment ${{ github.event.client_payload.issue_number }} --body "<dein Plan>"
+          claude_args: |
+            --model claude-sonnet-4-6
+            --max-turns 15
+            --permission-mode bypassPermissions
+            --allowedTools Read,Glob,Grep,Bash,WebFetch,WebSearch
+
+  execute:
+    if: github.event.action == 'telegram-execute'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install markitdown
+        run: pip install markitdown
+
+      - name: Configure git identity
+        env:
+          # Edit: map each site_id to the GitHub App installation login
+          # that should be listed as the commit author. If you only have
+          # one GitHub App for all sites, you can hard-code the name.
+          BOT_USERNAME: ${{ github.event.client_payload.site_id == 'example' && 'example-telegram-bot[bot]' || 'example-telegram-bot[bot]' }}
+        run: |
+          git config user.name "$BOT_USERNAME"
+          git config user.email "${BOT_USERNAME}@users.noreply.github.com"
+
+      - name: Create branch
+        env:
+          ISSUE_NUMBER: ${{ github.event.client_payload.issue_number }}
+        run: |
+          BRANCH="telegram/issue-${ISSUE_NUMBER}-$(date +%s)"
+          git checkout -b "$BRANCH"
+          echo "$BRANCH" > /tmp/branch_name
+
+      - name: Convert attached documents
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.client_payload.issue_number }}
+        run: |
+          ISSUE_BODY=$(gh issue view "$ISSUE_NUMBER" --json body -q '.body')
+          echo "" > /tmp/documents.md
+          echo "$ISSUE_BODY" | grep -oP '<!-- convertible:[^>]+-->' | while read -r marker; do
+            URL=$(echo "$marker" | sed -E 's/<!-- convertible:(.+):([^:]+) -->/\1/')
+            NAME=$(echo "$marker" | sed -E 's/<!-- convertible:(.+):([^:]+) -->/\2/')
+            EXT="${NAME##*.}"
+            TMP_FILE="/tmp/doc.${EXT}"
+            if curl -sL "$URL" -o "$TMP_FILE"; then
+              echo "### ${NAME}" >> /tmp/documents.md
+              markitdown "$TMP_FILE" >> /tmp/documents.md 2>/dev/null || echo "_(Konvertierung fehlgeschlagen)_" >> /tmp/documents.md
+              echo "" >> /tmp/documents.md
+            fi
+          done
+
+      - name: Prepare prompt
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.client_payload.issue_number }}
+        run: |
+          ISSUE_BODY=$(gh issue view "$ISSUE_NUMBER" --json body -q '.body')
+          COMMENTS=$(gh issue view "$ISSUE_NUMBER" --json comments -q '.comments[].body' | head -5000)
+          DOCUMENTS=$(cat /tmp/documents.md 2>/dev/null || echo "")
+
+          cat > /tmp/prompt.txt <<PROMPT_EOF
+          Auftrag und bisherige Diskussion:
+
+          ${ISSUE_BODY}
+
+          Kommentare:
+          ${COMMENTS}
+
+          Konvertierte Dokumente (DOCX/PDF):
+          ${DOCUMENTS}
+          PROMPT_EOF
+
+      - name: Run Claude (Execute)
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            Lies den Auftrag aus /tmp/prompt.txt und setze ihn um.
+
+            Site: ${{ github.event.client_payload.site_domain }}
+            Content-Verzeichnis: ${{ github.event.client_payload.site_content_dir }}
+
+            Lies CLAUDE.md für Content-Schemas und Conventions.
+            WICHTIG: Ändere NUR Dateien innerhalb von
+            ${{ github.event.client_payload.site_content_dir }}/src/content/ und
+            ${{ github.event.client_payload.site_content_dir }}/public/.
+            NIEMALS Daten erfinden.
+
+            Bei Bildern:
+            - FOTO (Eventfoto) → in ${{ github.event.client_payload.site_content_dir }}/public/images/
+              speichern und im Content referenzieren
+            - FLYER/EINLADUNG → Text extrahieren und als Content-Grundlage verwenden
+
+            Nach der Umsetzung:
+            1. `npx biome check --write` ausführen
+            2. `git add` und `git commit` (Identität ist bereits konfiguriert – KEIN `git config`)
+            3. NICHT pushen, KEIN PR erstellen
+
+            Arbeite im aktuellen Verzeichnis, KEIN Worktree.
+
+            WICHTIG: Schreibe am Ende eine JSON-Datei /tmp/result.json mit:
+            {"title": "PR Titel", "description": "Kurze Beschreibung", "paths": ["events/datei.md"]}
+            – paths enthält die erstellten/geänderten Content-Dateien relativ zu
+            ${{ github.event.client_payload.site_content_dir }}/src/content/.
+          claude_args: |
+            --model claude-sonnet-4-6
+            --max-turns 30
+            --permission-mode bypassPermissions
+            --allowedTools Read,Glob,Grep,Write,Edit,Bash,WebFetch,WebSearch
+
+      - name: Fallback commit if needed
+        run: |
+          if [ -n "$(git diff --name-only)" ]; then
+            git add -A
+          fi
+          if [ -n "$(git diff --cached --name-only)" ]; then
+            git commit -m "feat: Telegram Bot Auftrag umgesetzt"
+          fi
+          if [ "$(git log main..HEAD --oneline | wc -l)" -eq 0 ]; then
+            echo "::error::Claude hat keine Änderungen vorgenommen"
+            exit 1
+          fi
+          git log main..HEAD --oneline
+
+      - name: Push branch
+        run: git push origin "$(cat /tmp/branch_name)"
+
+      - name: Compute deep links
+        id: links
+        env:
+          SITE_CONTENT_DIR: ${{ github.event.client_payload.site_content_dir }}
+        run: |
+          DEEP_LINKS=""
+          if [ -f /tmp/result.json ]; then
+            DEEP_LINKS=$(jq -r '.paths[]? // empty' /tmp/result.json | while read -r p; do
+              p="${p%.md}"
+              echo "$p" | sed 's|^events/|/termine/|; s|^news/|/aktuelles/|'
+            done | head -3 | tr '\n' ' ')
+            PR_TITLE=$(jq -r '.title // empty' /tmp/result.json)
+            PR_DESC=$(jq -r '.description // empty' /tmp/result.json)
+            echo "pr_title=$PR_TITLE" >> "$GITHUB_OUTPUT"
+            echo "pr_desc=$PR_DESC" >> "$GITHUB_OUTPUT"
+          fi
+          echo "deep_links=$DEEP_LINKS" >> "$GITHUB_OUTPUT"
+
+      - name: Create PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.client_payload.issue_number }}
+          RESULT_TITLE: ${{ steps.links.outputs.pr_title }}
+        run: |
+          BRANCH=$(cat /tmp/branch_name)
+          ISSUE_TITLE=$(gh issue view "$ISSUE_NUMBER" --json title -q '.title')
+          PR_TITLE="${RESULT_TITLE:-$ISSUE_TITLE}"
+          RESPONSE=$(gh api repos/${{ github.repository }}/pulls \
+            -f head="$BRANCH" \
+            -f base=main \
+            -f title="$PR_TITLE" \
+            -f body="Closes #${ISSUE_NUMBER}")
+          PR_NUMBER=$(echo "$RESPONSE" | jq -r '.number')
+          PR_URL=$(echo "$RESPONSE" | jq -r '.html_url')
+          echo "url=$PR_URL" >> "$GITHUB_OUTPUT"
+          echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+
+      - name: Build preview
+        env:
+          SITE_WORKSPACE: ${{ github.event.client_payload.site_workspace }}
+        run: npm -w "$SITE_WORKSPACE" run build
+
+      - name: Deploy preview
+        id: preview
+        continue-on-error: true
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          ISSUE_NUMBER: ${{ github.event.client_payload.issue_number }}
+          SITE_ID: ${{ github.event.client_payload.site_id }}
+        working-directory: ${{ github.event.client_payload.site_content_dir }}
+        run: |
+          PREVIEW_NAME="preview-${SITE_ID}-issue-${ISSUE_NUMBER}"
+          sed -i '/\[build\]/,/^$/d' wrangler.toml
+          npx wrangler deploy \
+            --name "$PREVIEW_NAME" 2>&1 | tee /tmp/deploy.txt
+
+          PREVIEW_URL=$(grep -oP 'https://[^\s]+\.workers\.dev' /tmp/deploy.txt | head -1)
+          echo "url=$PREVIEW_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Notify Telegram via callback
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          ISSUE_NUMBER: ${{ github.event.client_payload.issue_number }}
+          # Edit: base URL of your deployed Telegram Worker
+          CALLBACK_URL: https://telegram.example.com/callback/${{ github.event.client_payload.site_id }}
+          PR_URL: ${{ steps.pr.outputs.url }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          PREVIEW_URL: ${{ steps.preview.outputs.url }}
+          DEEP_LINKS: ${{ steps.links.outputs.deep_links }}
+        run: |
+          ISSUE_TITLE=$(gh issue view "$ISSUE_NUMBER" --json title -q '.title')
+
+          curl -s -X POST "$CALLBACK_URL" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $WEBHOOK_SECRET" \
+            -d "$(jq -n \
+              --arg issue_number "$ISSUE_NUMBER" \
+              --arg issue_title "$ISSUE_TITLE" \
+              --arg pr_url "$PR_URL" \
+              --arg pr_number "$PR_NUMBER" \
+              --arg preview_url "$PREVIEW_URL" \
+              --arg deep_links "$DEEP_LINKS" \
+              '{
+                issue_number: ($issue_number | tonumber),
+                issue_title: $issue_title,
+                pr_url: $pr_url,
+                pr_number: ($pr_number | tonumber),
+                preview_url: $preview_url,
+                deep_links: $deep_links
+              }')"
+
+      - name: Notify error to Telegram
+        if: failure()
+        env:
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          ISSUE_NUMBER: ${{ github.event.client_payload.issue_number }}
+          # Edit: base URL of your deployed Telegram Worker
+          CALLBACK_URL: https://telegram.example.com/callback/${{ github.event.client_payload.site_id }}
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          ISSUE_TITLE=$(gh issue view "$ISSUE_NUMBER" --json title -q '.title' 2>/dev/null || echo "Unbekannt")
+
+          curl -s -X POST "$CALLBACK_URL" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $WEBHOOK_SECRET" \
+            -d "$(jq -n \
+              --arg issue_number "$ISSUE_NUMBER" \
+              --arg issue_title "$ISSUE_TITLE" \
+              --arg error "Umsetzung fehlgeschlagen. Run: https://github.com/${{ github.repository }}/actions/runs/${RUN_ID}" \
+              '{
+                issue_number: ($issue_number | tonumber),
+                issue_title: $issue_title,
+                error: $error
+              }')"
