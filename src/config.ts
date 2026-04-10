@@ -1,6 +1,7 @@
 import {
   type GitHubIssue,
   getSiteFromMap,
+  isOwnBotLoginInMap,
   type SiteConfig,
   siteFromLabelsInMap,
   type TelegramChatLabel,
@@ -49,6 +50,14 @@ export const getSite = (siteId: string): SiteConfig =>
 export const siteFromLabels = (
   labels: TelegramChatLabel[] | undefined,
 ): SiteConfig | null => siteFromLabelsInMap(SITES, labels);
+
+/**
+ * Check whether a GitHub login belongs to one of our own bots by
+ * matching against every site's botUsername. Robust against several
+ * sites sharing a single GitHub App installation.
+ */
+export const isOwnBotLogin = (login: string | undefined): boolean =>
+  isOwnBotLoginInMap(SITES, login);
 
 /**
  * Build the canonical issue body marker for a chat id + site.

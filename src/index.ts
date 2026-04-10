@@ -6,6 +6,8 @@ import {
   extractSiteId,
   GITHUB_REPO,
   getSite,
+  isOwnBotLogin,
+  SITES,
   siteFromLabels,
 } from "./config";
 import {
@@ -31,10 +33,12 @@ import {
 } from "./telegram";
 import type { Env, GitHubWebhookEvent, SiteConfig } from "./types";
 import {
+  decideThreadAction,
   getTelegramToken,
   hasUserContent,
   parseNewTaskCommand,
   pendingKey,
+  shouldNotifyOnPrOpened,
   userKey,
   userListPrefix,
 } from "./types";
@@ -62,13 +66,35 @@ export default {
         return new Response("Unknown site", { status: 404 });
       }
 
-      const update = await request.json();
+      // biome-ignore lint/suspicious/noExplicitAny: raw Telegram update
+      const update: any = await request.json();
       const token = getTelegramToken(env, site);
       const api = createApi(token);
       try {
         await handleTelegram(update, api, env, site, ctx);
       } catch (error) {
         console.error("Telegram handler error:", error);
+        // Try to at least tell the user something went wrong, instead
+        // of leaving them in the dark staring at a silent bot.
+        const fallbackChatId =
+          update?.message?.chat?.id ??
+          update?.callback_query?.message?.chat?.id;
+        const fallbackThreadId =
+          update?.message?.message_thread_id ??
+          update?.callback_query?.message?.message_thread_id;
+        if (fallbackChatId) {
+          try {
+            await sendMessage(
+              api,
+              fallbackChatId,
+              `❌ Something went wrong while processing your message.\n\nError: ${error instanceof Error ? error.message : String(error)}\n\nIf this keeps happening, contact the admin.`,
+              undefined,
+              fallbackThreadId,
+            );
+          } catch (sendError) {
+            console.error("Fallback sendMessage failed:", sendError);
+          }
+        }
       }
       return new Response("OK");
     }
@@ -129,14 +155,14 @@ export default {
 
     // --- Health Check ---
     if (url.pathname === "/health") {
-      const required: (keyof Env)[] = [
+      const required: string[] = [
         "GITHUB_APP_ID",
         "GITHUB_APP_PRIVATE_KEY",
         "GITHUB_APP_INSTALLATION_ID",
-        "TELEGRAM_TOKEN",
-        "TELEGRAM_TOKEN_RBA",
         "WEBHOOK_SECRET",
         "OPENAI_API_KEY",
+        // One Telegram bot token per configured site.
+        ...Object.values(SITES).map((s) => s.tokenKey),
       ];
       const missing = required.filter((k) => !env[k]);
       if (missing.length > 0) {
@@ -171,8 +197,8 @@ async function handleTelegram(
 }
 
 // ─── Topic/Thread KV Helpers ───
-// Thread-Mappings werden pro Site gespeichert, damit Gemeinde- und
-// RBA-Threads sich nicht überschneiden.
+// Thread mappings are stored per site so that threads from different
+// sites never collide.
 
 async function getTopicId(
   env: Env,
@@ -367,17 +393,20 @@ async function handleMessage(
         newThreadId,
       );
     } catch (error) {
-      console.error("createForumTopic failed:", error);
+      console.error(
+        `createForumTopic failed for chat ${chatId} thema "${thema}":`,
+        error,
+      );
       await sendMessage(
         api,
         chatId,
-        "❌ Thread konnte nicht angelegt werden. Sind Topics im Chat aktiviert?",
+        "❌ Could not create a new thread.\n\nLikely causes:\n• Topics are not enabled for this bot yet (BotFather → Bot Settings → Topics in Private Chats → Enable)\n• The bot is not allowed to create topics in this chat\n\nIf this keeps happening, contact the admin.",
       );
     }
     return;
   }
 
-  // ── Nachricht in einem Thread ─────────────────────────────
+  // ── Message inside a thread ───────────────────────────────
 
   if (threadId) {
     const issueNumber = await getIssueFromThread(
@@ -386,102 +415,130 @@ async function handleMessage(
       chatId,
       threadId,
     );
+    const thema = await env.USERS.get(
+      `pending-task:${site.id}:${chatId}:${threadId}`,
+    );
+    const action = decideThreadAction(issueNumber, thema);
 
-    // Antwort auf ein bestehendes Issue
-    if (issueNumber) {
-      let replyText = message.text ?? message.caption ?? "";
+    switch (action.kind) {
+      case "reply": {
+        let replyText = message.text ?? message.caption ?? "";
 
-      const audioFileId = message.voice?.file_id ?? message.audio?.file_id;
-      if (audioFileId) {
-        try {
-          const fileUrl = await getFileUrl(api, token, audioFileId);
-          replyText = await transcribeVoice(env, fileUrl);
+        const audioFileId = message.voice?.file_id ?? message.audio?.file_id;
+        if (audioFileId) {
+          try {
+            const fileUrl = await getFileUrl(api, token, audioFileId);
+            replyText = await transcribeVoice(env, fileUrl);
+            await sendMessage(
+              api,
+              chatId,
+              `🎙️ Erkannt: „${replyText}"`,
+              undefined,
+              threadId,
+            );
+          } catch {
+            await sendMessage(
+              api,
+              chatId,
+              "❌ Audio konnte nicht transkribiert werden.",
+              undefined,
+              threadId,
+            );
+            return;
+          }
+        }
+
+        if (!replyText) {
           await sendMessage(
             api,
             chatId,
-            `🎙️ Erkannt: „${replyText}"`,
-            undefined,
-            threadId,
-          );
-        } catch {
-          await sendMessage(
-            api,
-            chatId,
-            "❌ Audio konnte nicht transkribiert werden.",
+            "❓ This message has no usable content (text, voice, photo or document).",
             undefined,
             threadId,
           );
           return;
         }
-      }
 
-      if (!replyText) return;
-
-      let issueCtx = `#${issueNumber}`;
-      try {
-        const iss = await getIssue(env, issueNumber);
-        const short =
-          iss.title.length > 40 ? `${iss.title.substring(0, 37)}…` : iss.title;
-        issueCtx = `#${issueNumber} „${short}"`;
-      } catch {
-        /* keep default */
-      }
-
-      await commentOnIssue(
-        env,
-        issueNumber,
-        `**${userName} (via Telegram):**\n\n${replyText}`,
-      );
-      await triggerDispatch(
-        env,
-        "telegram-plan",
-        sitePayload(site, issueNumber),
-      );
-      await sendMessage(
-        api,
-        chatId,
-        `💬 Antwort zu ${issueCtx} gesendet. Claude überarbeitet den Plan…`,
-        undefined,
-        threadId,
-      );
-      return;
-    }
-
-    // Thread wartet auf Inhalt für einen neuen Auftrag?
-    const thema = await env.USERS.get(
-      `pending-task:${site.id}:${chatId}:${threadId}`,
-    );
-    if (thema) {
-      if (message.media_group_id) {
-        const groupKey = `mediagroup:${site.id}:${threadId}:${message.media_group_id}`;
-        const existing = await env.USERS.get(groupKey);
-        // biome-ignore lint/suspicious/noExplicitAny: buffered raw messages
-        const messages: any[] = existing ? JSON.parse(existing) : [];
-        messages.push(message);
-        await env.USERS.put(groupKey, JSON.stringify(messages), {
-          expirationTtl: 60,
-        });
-        if (messages.length === 1) {
-          ctx.waitUntil(
-            processMediaGroupDelayed(groupKey, env, site, threadId, thema),
-          );
+        let issueCtx = `#${action.issueNumber}`;
+        try {
+          const iss = await getIssue(env, action.issueNumber);
+          const short =
+            iss.title.length > 40
+              ? `${iss.title.substring(0, 37)}…`
+              : iss.title;
+          issueCtx = `#${action.issueNumber} „${short}"`;
+        } catch {
+          /* keep default */
         }
+
+        await commentOnIssue(
+          env,
+          action.issueNumber,
+          `**${userName} (via Telegram):**\n\n${replyText}`,
+        );
+        await triggerDispatch(
+          env,
+          "telegram-plan",
+          sitePayload(site, action.issueNumber),
+        );
+        await sendMessage(
+          api,
+          chatId,
+          `💬 Reply for ${issueCtx} sent. Claude is revising the plan…`,
+          undefined,
+          threadId,
+        );
         return;
       }
 
-      await processSingleMessageAsTask(
-        message,
-        api,
-        env,
-        site,
-        threadId,
-        thema,
-      );
-      return;
-    }
+      case "newTask": {
+        if (message.media_group_id) {
+          const groupKey = `mediagroup:${site.id}:${threadId}:${message.media_group_id}`;
+          const existing = await env.USERS.get(groupKey);
+          // biome-ignore lint/suspicious/noExplicitAny: buffered raw messages
+          const messages: any[] = existing ? JSON.parse(existing) : [];
+          messages.push(message);
+          await env.USERS.put(groupKey, JSON.stringify(messages), {
+            expirationTtl: 60,
+          });
+          if (messages.length === 1) {
+            ctx.waitUntil(
+              processMediaGroupDelayed(
+                groupKey,
+                env,
+                site,
+                threadId,
+                action.thema,
+              ),
+            );
+          }
+          return;
+        }
 
-    // Unbekannter Thread ohne Issue und ohne Pending-Flag → ignorieren
-    return;
+        await processSingleMessageAsTask(
+          message,
+          api,
+          env,
+          site,
+          threadId,
+          action.thema,
+        );
+        return;
+      }
+
+      case "unknownThread": {
+        // Old thread or topic without KV mapping. NEVER silently return —
+        // tell the user what happened so they know how to recover.
+        await sendMessage(
+          api,
+          chatId,
+          "❓ This thread is not linked to an active task.\n\nStart a new task with /new_task THEMA in the main chat. If this is an old thread, close it.",
+          undefined,
+          threadId,
+        );
+        return;
+      }
+    }
   }
 
   // ── Nachricht im General-Chat ohne Command ────────────────
@@ -612,7 +669,16 @@ async function processSingleMessageAsTask(
     }
   }
 
-  if (!text && attachments.length === 0) return;
+  if (!text && attachments.length === 0) {
+    await sendMessage(
+      api,
+      chatId,
+      "❓ This message has no usable content (text, voice, photo or document). Send something I can process.",
+      undefined,
+      threadId,
+    );
+    return;
+  }
 
   await createAndDispatchIssueInThread(
     api,
@@ -649,7 +715,7 @@ ${text}${attachmentSection}
 
 ---
 
-@${site.botUsername} Bitte analysiere diesen Auftrag für die CDU-Website ${site.domain} und erstelle einen kurzen Plan (3-5 Stichpunkte), was geändert werden soll. Erfinde NIEMALS Daten – nur verwenden was im Auftrag steht. Fehlende Infos als „❓ fehlt noch" kennzeichnen.`;
+@${site.botUsername} Bitte analysiere diesen Auftrag für die Website ${site.domain} und erstelle einen kurzen Plan (3-5 Stichpunkte), was geändert werden soll. Erfinde NIEMALS Daten – nur verwenden was im Auftrag steht. Fehlende Infos als „❓ fehlt noch" kennzeichnen.`;
 
   try {
     const issueNumber = await createIssue(env, site.id, title, body);
@@ -984,8 +1050,11 @@ async function handleIssueComment(
   const site = siteFromLabels(issue.labels);
   if (!site) return;
 
-  // Skip our own app's comments (der jeweilige Bot-Account)
-  if (event.sender.login === site.botUsername) return;
+  // Skip our own bot's comments (matched against ALL SITES so that
+  // sites sharing one GitHub App don't forward the bot's own
+  // "please implement" instructions back to the user as if they were
+  // a Claude reply).
+  if (isOwnBotLogin(event.sender.login)) return;
 
   try {
     await reactToComment(env, comment.id, "eyes");
@@ -1037,6 +1106,7 @@ async function handlePullRequestOpened(
   let siteId = extractSiteId(pr.body);
   let issueTitle = "";
   let linkedIssueNum: number | null = null;
+  let linkedLabels: { name: string }[] | undefined;
 
   if (pr.body) {
     const issueMatch = pr.body.match(/#(\d+)/);
@@ -1047,11 +1117,18 @@ async function handlePullRequestOpened(
         if (!chatId) chatId = extractChatId(issue.body);
         if (!siteId) siteId = extractSiteId(issue.body);
         issueTitle = issue.title;
+        linkedLabels = issue.labels;
       } catch {
         // ignore
       }
     }
   }
+
+  // PRs opened for a Telegram-issue are already announced by the
+  // workflow callback with preview links — those are far more useful
+  // for non-developer reviewers than a bare PR link, so we skip the
+  // duplicate notification here.
+  if (!shouldNotifyOnPrOpened(linkedLabels)) return;
 
   if (!chatId || !siteId) return;
   let site: SiteConfig;
@@ -1108,7 +1185,25 @@ async function handleActionCallback(
 ): Promise<void> {
   const issue = await getIssue(env, payload.issue_number);
   const chatId = extractChatId(issue.body);
-  if (!chatId) return;
+  if (!chatId) {
+    // The issue has no chat_id marker — happens when someone created
+    // the issue manually or the marker was lost in an edit. We do not
+    // know who to send the preview to, so notify the admin instead of
+    // dying silently.
+    console.error(
+      `handleActionCallback: no chatId in issue #${payload.issue_number}`,
+    );
+    try {
+      await sendMessage(
+        api,
+        ADMIN_ID,
+        `🔧 Workflow callback for #${payload.issue_number} „${payload.issue_title}" could not be delivered — no chat_id marker in the issue body. (${site.name})`,
+      );
+    } catch {
+      /* nothing more we can do */
+    }
+    return;
+  }
 
   const threadId =
     (await getTopicId(env, site.id, chatId, payload.issue_number)) ?? undefined;
@@ -1119,7 +1214,7 @@ async function handleActionCallback(
       "",
       payload.error,
       "",
-      "Falls du diesen Fehler nicht selbst lösen kannst, leite diese Nachricht bitte an Levin Keller weiter.",
+      "If you cannot solve this yourself, forward this message to the admin.",
     ].join("\n");
 
     await sendMessage(api, chatId, errorMsg, undefined, threadId);

@@ -71,6 +71,60 @@ export function siteFromLabelsInMap(
   return null;
 }
 
+/**
+ * Check whether a GitHub user login belongs to one of our own bots.
+ *
+ * Used to skip the bot's own issue comments when relaying Claude replies
+ * back to Telegram — otherwise the bot forwards its own "please implement"
+ * instructions to the user as if Claude had written them. The check
+ * matches against ALL SITES' botUsername values, so it still works when
+ * several sites share a single GitHub App installation.
+ */
+export function isOwnBotLoginInMap(
+  sites: Record<string, SiteConfig>,
+  login: string | undefined,
+): boolean {
+  if (!login) return false;
+  for (const site of Object.values(sites)) {
+    if (site.botUsername === login) return true;
+  }
+  return false;
+}
+
+/**
+ * Should the pull_request.opened webhook fire its own Telegram notification?
+ *
+ * No, if the PR is linked to an issue that came from the Telegram workflow
+ * (label `telegram`). In that case the workflow callback already sends a
+ * notification with preview links, which is far more useful for board
+ * members without a GitHub account than a bare PR link.
+ */
+export function shouldNotifyOnPrOpened(
+  linkedIssueLabels: TelegramChatLabel[] | undefined,
+): boolean {
+  if (!linkedIssueLabels) return true;
+  return !linkedIssueLabels.some((l) => l.name === "telegram");
+}
+
+/**
+ * What should happen with a message that arrives inside a thread?
+ * Pure function over the two KV lookups a handler does first — so the
+ * decision is easy to unit-test.
+ */
+export type ThreadAction =
+  | { kind: "reply"; issueNumber: number }
+  | { kind: "newTask"; thema: string }
+  | { kind: "unknownThread" };
+
+export function decideThreadAction(
+  issueNumber: number | null,
+  pendingThema: string | null,
+): ThreadAction {
+  if (issueNumber !== null) return { kind: "reply", issueNumber };
+  if (pendingThema !== null) return { kind: "newTask", thema: pendingThema };
+  return { kind: "unknownThread" };
+}
+
 /** Read the Telegram bot token for a given site from the Env. */
 export function getTelegramToken(env: Env, site: SiteConfig): string {
   const value = env[site.tokenKey];

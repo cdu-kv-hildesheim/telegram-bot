@@ -1,12 +1,15 @@
 import { describe, expect, it } from "vitest";
 import {
+  decideThreadAction,
   type Env,
   getSiteFromMap,
   getTelegramToken,
   hasUserContent,
+  isOwnBotLoginInMap,
   parseNewTaskCommand,
   pendingKey,
   type SiteConfig,
+  shouldNotifyOnPrOpened,
   siteFromLabelsInMap,
   userKey,
   userListPrefix,
@@ -189,6 +192,107 @@ describe("parseNewTaskCommand", () => {
     expect(parseNewTaskCommand("/new_task Titel\nZusatzinfo")).toBe(
       "Titel\nZusatzinfo",
     );
+  });
+});
+
+describe("shouldNotifyOnPrOpened", () => {
+  it("returns false when the linked issue has the telegram label (callback handles it)", () => {
+    expect(
+      shouldNotifyOnPrOpened([{ name: "telegram" }, { name: "site:foo" }]),
+    ).toBe(false);
+  });
+
+  it("returns true for normal PRs not from the telegram workflow", () => {
+    expect(shouldNotifyOnPrOpened([{ name: "bug" }])).toBe(true);
+  });
+
+  it("returns true when there are no labels at all", () => {
+    expect(shouldNotifyOnPrOpened([])).toBe(true);
+  });
+
+  it("returns true when labels are undefined (PR has no linked issue)", () => {
+    expect(shouldNotifyOnPrOpened(undefined)).toBe(true);
+  });
+
+  it("REGRESSION: telegram label causes skip even with other labels around", () => {
+    // This is the actual symptom: users got two notifications because
+    // handlePullRequestOpened fired alongside the workflow callback.
+    expect(
+      shouldNotifyOnPrOpened([
+        { name: "site:foo" },
+        { name: "telegram" },
+        { name: "enhancement" },
+      ]),
+    ).toBe(false);
+  });
+});
+
+describe("isOwnBotLoginInMap", () => {
+  it("returns true for a login matching site.botUsername", () => {
+    expect(isOwnBotLoginInMap(fixtureSites, "foo-bot[bot]")).toBe(true);
+    expect(isOwnBotLoginInMap(fixtureSites, "bar-bot[bot]")).toBe(true);
+  });
+
+  it("REGRESSION: matches across all SITES so a shared GitHub App is recognised as own bot for every site", () => {
+    // Several sites may share a single GitHub App installation, so the
+    // filter must recognise that login for any site, otherwise the bot's
+    // own 'please implement' comment gets forwarded back into Telegram
+    // as if it were a Claude reply.
+    const sharedSites: Record<string, SiteConfig> = {
+      alpha: { ...fixtureSites.foo, id: "alpha", botUsername: "shared[bot]" },
+      beta: { ...fixtureSites.bar, id: "beta", botUsername: "shared[bot]" },
+    };
+    expect(isOwnBotLoginInMap(sharedSites, "shared[bot]")).toBe(true);
+  });
+
+  it("returns false for human users", () => {
+    expect(isOwnBotLoginInMap(fixtureSites, "levino")).toBe(false);
+    expect(isOwnBotLoginInMap(fixtureSites, "some-other-user")).toBe(false);
+  });
+
+  it("returns false for unrelated bots", () => {
+    expect(isOwnBotLoginInMap(fixtureSites, "dependabot[bot]")).toBe(false);
+    expect(isOwnBotLoginInMap(fixtureSites, "github-actions[bot]")).toBe(false);
+  });
+
+  it("returns false for undefined", () => {
+    expect(isOwnBotLoginInMap(fixtureSites, undefined)).toBe(false);
+  });
+});
+
+describe("decideThreadAction", () => {
+  it("returns reply when there is an existing issue", () => {
+    expect(decideThreadAction(123, null)).toEqual({
+      kind: "reply",
+      issueNumber: 123,
+    });
+  });
+
+  it("returns newTask when there is a pending thema", () => {
+    expect(decideThreadAction(null, "Stammtisch am 25.4.")).toEqual({
+      kind: "newTask",
+      thema: "Stammtisch am 25.4.",
+    });
+  });
+
+  it("REGRESSION: returns unknownThread instead of silently doing nothing when neither", () => {
+    // This must NEVER be a bare null that the worker silently ignores —
+    // the user needs to know that their message went nowhere.
+    expect(decideThreadAction(null, null)).toEqual({ kind: "unknownThread" });
+  });
+
+  it("prefers an existing issue over a pending thema (shouldn't happen but be deterministic)", () => {
+    expect(decideThreadAction(123, "leftover")).toEqual({
+      kind: "reply",
+      issueNumber: 123,
+    });
+  });
+
+  it("treats issueNumber 0 as a real reply (defensive)", () => {
+    expect(decideThreadAction(0, null)).toEqual({
+      kind: "reply",
+      issueNumber: 0,
+    });
   });
 });
 

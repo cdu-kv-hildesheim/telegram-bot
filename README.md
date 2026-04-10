@@ -56,7 +56,7 @@ telegram-bot/                   ← this repo
 │   ├── telegram.ts             ← grammY wrapper
 │   ├── github.ts               ← GitHub App auth + API
 │   ├── openai.ts               ← Whisper transcription
-│   ├── types.test.ts           ← Pure-helper tests (44+)
+│   ├── types.test.ts           ← Pure-helper tests (50+)
 │   └── github.test.ts          ← Chat-id marker tests
 ├── examples/
 │   ├── bot.example.json        ← Per-site bot config template

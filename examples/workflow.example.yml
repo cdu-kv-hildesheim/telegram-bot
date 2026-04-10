@@ -71,6 +71,11 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # The dispatch comes from the Telegram bot's GitHub App, not
+          # from a human. claude-code-action blocks bot actors by
+          # default — we allow all bots because write access to this
+          # repo is already gated by the worker's WEBHOOK_SECRET.
+          allowed_bots: "*"
           prompt: |
             Lies den Auftrag aus /tmp/prompt.txt und analysiere ihn.
             Site: ${{ github.event.client_payload.site_domain }}
@@ -181,6 +186,11 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # The dispatch comes from the Telegram bot's GitHub App, not
+          # from a human. claude-code-action blocks bot actors by
+          # default — we allow all bots because write access to this
+          # repo is already gated by the worker's WEBHOOK_SECRET.
+          allowed_bots: "*"
           prompt: |
             Lies den Auftrag aus /tmp/prompt.txt und setze ihn um.
 
@@ -197,6 +207,16 @@ jobs:
             - FOTO (Eventfoto) → in ${{ github.event.client_payload.site_content_dir }}/public/images/
               speichern und im Content referenzieren
             - FLYER/EINLADUNG → Text extrahieren und als Content-Grundlage verwenden
+
+            Datums-Felder (date, endDate) im Frontmatter MÜSSEN immer mit
+            einem expliziten Timezone-Suffix geschrieben werden, z.B. für
+            Europe/Berlin:
+            - Sommer (CEST, ca. Ende März bis Ende Oktober): "2026-05-01T15:00:00+02:00"
+            - Winter (CET, sonst):                            "2026-03-02T19:00:00+01:00"
+            NIEMALS naive Zeiten ohne Suffix wie "2026-05-01T15:00:00" —
+            die werden als UTC interpretiert und erscheinen 1-2 Stunden zu
+            spät in den Cards. Passe den Timezone-Offset an die Zielzeitzone
+            deiner Site an.
 
             Nach der Umsetzung:
             1. `npx biome check --write` ausführen
@@ -230,7 +250,15 @@ jobs:
           git log main..HEAD --oneline
 
       - name: Push branch
-        run: git push origin "$(cat /tmp/branch_name)"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # claude-code-action wipes the persistent git credentials that
+          # actions/checkout installed, so we push with an explicit
+          # token URL instead of relying on the extraheader in
+          # .git/config.
+          BRANCH=$(cat /tmp/branch_name)
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" "$BRANCH"
 
       - name: Compute deep links
         id: links
