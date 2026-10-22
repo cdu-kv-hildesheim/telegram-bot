@@ -15,7 +15,7 @@
     "grammy": "^1.42.0"
   },
   "devDependencies": {
-    "@biomejs/biome": "^2.3.11",
+    "@biomejs/biome": "2.6.2",
     "@cloudflare/workers-types": "^4.20250321.0",
     "vitest": "^4.1.4",
     "wrangler": "^4.14.0"
